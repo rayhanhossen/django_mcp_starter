@@ -1,0 +1,6 @@
+social-auth-core==4.7.0
+social-auth-app-django==5.5.1
+fastmcp==2.11.3
+asgiref==3.9.1
+Django==5.2.5
+sqlparse==0.5.3
