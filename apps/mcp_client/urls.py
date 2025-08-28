@@ -1,7 +1,7 @@
 from django.urls import path
-from .views import summarize_numbers_views, slugify_text_views
+from .views import SummarizeNumbersView, SlugifyTextView
 
 urlpatterns = [
-    path("summarize-numbers", summarize_numbers_views, name="summarize_numbers"),
-    path("slugify-text", slugify_text_views, name="slugify_text"),
+    path("summarize-numbers", SummarizeNumbersView.as_view(), name="summarize_numbers"),
+    path("slugify-text", SlugifyTextView.as_view(), name="slugify_text"),
 ]
