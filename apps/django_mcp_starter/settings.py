@@ -38,7 +38,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'brac_auth',
-    'mcp_client',
+    'mcp_caller',
 ]
 
 MIDDLEWARE = [
