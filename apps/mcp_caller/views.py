@@ -5,6 +5,8 @@ from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 
 from .mcp_call_tool import call_mcp_tool, MCPError
+from .services.intent_router import parse_intent
+from .services.llama_summary_local import summarize_with_llama_local
 
 
 @method_decorator(csrf_exempt, name="dispatch")
@@ -60,3 +62,64 @@ class SlugifyTextView(View):
             return JsonResponse({"error": str(me)}, status=400)
         except Exception as ex:
             return JsonResponse({"error": str(ex)}, status=500)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class ChatToolView(View):
+    http_method_names = ["post"]
+
+    async def post(self, request: HttpRequest, *args, **kwargs) -> JsonResponse:
+        # 1) Parse input
+        try:
+            payload_raw = request.body or b"{}"
+            try:
+                body = json.loads(payload_raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                raise ValueError("Invalid JSON")
+            if not isinstance(body, dict):
+                raise ValueError("Payload must be a JSON object")
+            message = (body.get("message") or "").strip()
+            if not message:
+                return JsonResponse({"error": "message is required"}, status=400)
+        except ValueError as ve:
+            return JsonResponse({"error": str(ve)}, status=400)
+
+        # 2) Intent → tool + args
+        tool_name, arguments = await parse_intent(message)
+        if not tool_name:
+            return JsonResponse({
+                "error": "Could not determine intent. Try: 'weather in Dhaka', 'slugify: Hello World', or 'stats 1,2,3'."
+            }, status=400)
+
+        # 3) Run tool
+        try:
+            tool_data = await call_mcp_tool(
+                name=tool_name,
+                arguments=arguments,
+                timeout=12.0,
+            )
+        except MCPError as me:
+            return JsonResponse({"error": f"Tool error: {str(me)}", "tool": tool_name}, status=400)
+
+        # 4) Summarize with Llama
+        summary_input = {
+            "tool": tool_name,
+            "arguments": arguments,
+            "result": tool_data,
+        }
+        try:
+            summary = await summarize_with_llama_local(content=json.dumps(summary_input, ensure_ascii=False))
+        except Exception as e:
+            return JsonResponse({
+                "tool": tool_name,
+                "arguments": arguments,
+                "data": tool_data,
+                "summary_error": str(e),
+            }, status=200)
+
+        return JsonResponse({
+            "tool": tool_name,
+            "arguments": arguments,
+            "data": tool_data,
+            "summary": summary,
+        }, status=200)
