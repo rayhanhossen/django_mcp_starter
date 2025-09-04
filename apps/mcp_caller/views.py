@@ -1,5 +1,5 @@
 import json
-from django.http import HttpRequest, JsonResponse
+from django.http import HttpRequest, JsonResponse, StreamingHttpResponse
 from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
@@ -68,7 +68,7 @@ class SlugifyTextView(View):
 class ChatToolView(View):
     http_method_names = ["post"]
 
-    async def post(self, request: HttpRequest, *args, **kwargs) -> JsonResponse:
+    async def post(self, request: HttpRequest, *args, **kwargs):
         # 1) Parse input
         try:
             payload_raw = request.body or b"{}"
@@ -84,12 +84,32 @@ class ChatToolView(View):
         except ValueError as ve:
             return JsonResponse({"error": str(ve)}, status=400)
 
+        # --- Single helper for Llama SSE streaming ---
+        async def llama_event_stream(text: str):
+            try:
+                async for chunk in summarize_with_llama_local(text):
+                    yield f"data: {chunk}\n\n"
+                yield "event: done\ndata: [DONE]\n\n"
+            except Exception as e:
+                err = str(e).replace("\n", " ")
+                yield f"event: error\ndata: {json.dumps({'error': err})}\n\n"
+                yield "event: done\ndata: [DONE]\n\n"
+
         # 2) Intent → tool + args
-        tool_name, arguments = await parse_intent(message)
+        try:
+            tool_name, arguments = await parse_intent(message)
+        except Exception:
+            tool_name, arguments = None, None
+
+        # Fallback A: no tool detected → stream Llama on the user's message
         if not tool_name:
-            return JsonResponse({
-                "error": "Could not determine intent. Try: 'weather in Dhaka', 'slugify: Hello World', or 'stats 1,2,3'."
-            }, status=400)
+            return StreamingHttpResponse(
+                llama_event_stream(message),
+                content_type="text/event-stream"
+            )
+
+        # If tool found → print it
+        print("Tool found:", tool_name)
 
         # 3) Run tool
         try:
@@ -99,27 +119,25 @@ class ChatToolView(View):
                 timeout=12.0,
             )
         except MCPError as me:
+            # Fallback B: tool missing → stream Llama on the user's message
+            lower_msg = str(me).lower()
+            if "not found" in lower_msg or "unknown tool" in lower_msg or "toolnotfound" in lower_msg:
+                return StreamingHttpResponse(
+                    llama_event_stream(message),
+                    content_type="text/event-stream"
+                )
+            # Other MCP errors → JSON error
             return JsonResponse({"error": f"Tool error: {str(me)}", "tool": tool_name}, status=400)
 
-        # 4) Summarize with Llama
-        summary_input = {
-            "tool": tool_name,
-            "arguments": arguments,
-            "result": tool_data,
-        }
-        try:
-            summary = await summarize_with_llama_local(content=json.dumps(summary_input, ensure_ascii=False))
-        except Exception as e:
-            return JsonResponse({
-                "tool": tool_name,
-                "arguments": arguments,
-                "data": tool_data,
-                "summary_error": str(e),
-            }, status=200)
+        # Print tool data
+        print("Tool data:", tool_data.get("data", ""))
+        # 4) Summarize tool result with Llama (normal path)
+        content = json.dumps(tool_data.get("data", ""), ensure_ascii=False)
 
-        return JsonResponse({
-            "tool": tool_name,
-            "arguments": arguments,
-            "data": tool_data,
-            "summary": summary,
-        }, status=200)
+        # 5) SSE stream of the summary (reuse same helper)
+        return StreamingHttpResponse(
+            llama_event_stream(content),
+            content_type="text/event-stream",
+        )
+
+

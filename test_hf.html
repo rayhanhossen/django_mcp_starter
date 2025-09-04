@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Mini Chat (SSE)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { --bg:#0b0e14; --panel:#121621; --muted:#a0a8b8; --text:#e6eaf2; --accent:#4f8cff; --user:#2a3446; --ai:#1b2130; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
+    .app { max-width: 900px; margin: 0 auto; height: 100dvh; display: grid; grid-template-rows: auto 1fr auto; }
+    header { padding: 16px 20px; border-bottom: 1px solid #222736; background:var(--panel); position: sticky; top:0; z-index:1;}
+    header h1 { margin:0; font-size: 16px; font-weight:600; letter-spacing:.3px; }
+    .chat { padding: 20px; overflow-y: auto; scroll-behavior: smooth; }
+    .msg { display: flex; gap: 12px; margin: 10px 0; }
+    .msg .avatar { width: 32px; height: 32px; border-radius: 8px; display:grid; place-items:center; font-weight:700; }
+    .msg.user .avatar { background: var(--accent); color: white; }
+    .msg.ai .avatar { background: #343b4d; color: white; }
+    .bubble { padding: 12px 14px; border-radius: 14px; max-width: 80%; white-space: pre-wrap; line-height: 1.45; font-size: 15px; }
+    .msg.user .bubble { background: var(--user); }
+    .msg.ai .bubble { background: var(--ai); }
+    .typing { display:inline-block; min-width: 10px; }
+    .footer { border-top:1px solid #222736; background:var(--panel); padding: 12px; }
+    form { display:flex; gap:10px; }
+    textarea { resize: none; height: 48px; padding: 12px 14px; width:100%; background:#0e1422; color:var(--text); border:1px solid #2a3142; border-radius: 12px; outline:none; }
+    textarea:focus { border-color: var(--accent); }
+    button { background: var(--accent); color:white; border:none; padding: 0 16px; border-radius: 10px; font-weight:600; cursor:pointer; }
+    button:disabled { opacity:.6; cursor:not-allowed; }
+    .hint { color: var(--muted); font-size:12px; margin-top:6px; }
+    a { color: var(--muted); }
+    .error { color:#ff8a8a; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>Mini Chat (Server-Sent Streaming)</h1>
+    </header>
+
+    <main id="chat" class="chat"></main>
+
+    <div class="footer">
+      <form id="chat-form">
+        <textarea id="input" placeholder="Type your message and hit Enter…" autofocus></textarea>
+        <button id="send" type="submit">Send</button>
+      </form>
+      <div class="hint">Streaming expects your server to return <code>text/event-stream</code> and emit lines prefixed with <code>data:</code>, ending with <code>event: done</code> or <code>[DONE]</code>.</div>
+    </div>
+  </div>
+
+  <script>
+    // CHANGE THIS to your Django route that returns SSE via POST
+    const SSE_ENDPOINT = "http://127.0.0.1:8000/api/chat"; // e.g., your ChatToolView URL
+
+    const chatEl  = document.getElementById('chat');
+    const formEl  = document.getElementById('chat-form');
+    const inputEl = document.getElementById('input');
+    const sendBtn = document.getElementById('send');
+
+    function appendMsg(role, text = "") {
+      const wrap = document.createElement('div');
+      wrap.className = `msg ${role}`;
+      wrap.innerHTML = `
+        <div class="avatar">${role === 'user' ? 'U' : 'AI'}</div>
+        <div class="bubble"><span class="typing">${escapeHtml(text)}</span></div>
+      `;
+      chatEl.appendChild(wrap);
+      chatEl.scrollTop = chatEl.scrollHeight;
+      return wrap.querySelector('.typing');
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    function setLoading(loading) {
+      sendBtn.disabled = loading;
+      inputEl.disabled = loading;
+    }
+
+    // Very small SSE line parser for fetch streaming
+    // Collects bytes -> text -> splits on \n\n -> processes lines like "data: <chunk>"
+    async function streamSSEFromFetch(response, onData, onEvent) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Process complete events separated by double newlines
+        let sep;
+        while ((sep = buffer.indexOf("\n\n")) !== -1) {
+          const rawEvent = buffer.slice(0, sep);
+          buffer = buffer.slice(sep + 2);
+
+          const lines = rawEvent.split("\n");
+          let event = "message";
+          let dataParts = [];
+
+          for (const line of lines) {
+            if (line.startsWith("event:")) {
+              event = line.slice(6).trim();
+            } else if (line.startsWith("data:")) {
+              dataParts.push(line.slice(5)); // keep exact payload (may be JSON or text)
+            }
+          }
+
+          const data = dataParts.join("\n");
+
+          if (event === "error") {
+            onEvent?.("error", data);
+          } else if (event === "done") {
+            onEvent?.("done", data);
+          } else {
+            onData?.(data);
+          }
+        }
+      }
+
+      // Flush any trailing text that wasn't terminated by \n\n
+      if (buffer.trim()) {
+        onData?.(buffer);
+      }
+    }
+
+    async function sendMessage(message) {
+      // 1) Show user bubble
+      appendMsg('user', message);
+
+      // 2) Prepare assistant bubble to progressively fill
+      const aiNode = appendMsg('ai', "");
+
+      try {
+        setLoading(true);
+
+        const res = await fetch(SSE_ENDPOINT, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message }),
+        });
+
+        if (!res.ok || !res.body) {
+          aiNode.innerHTML = `<span class="error">Request failed (${res.status}). Ensure your endpoint streams <code>text/event-stream</code> on POST.</span>`;
+          return;
+        }
+
+        // 3) Read and parse SSE chunks, appending text to the AI bubble
+        await streamSSEFromFetch(
+          res,
+          (data) => {
+            if (!data) return;
+            // Each server "data:" is appended verbatim; you may want to JSON.parse if you send JSON
+            if (data === "[DONE]") return; // optional
+            aiNode.textContent += data;
+            chatEl.scrollTop = chatEl.scrollHeight;
+          },
+          (event, payload) => {
+            if (event === "error") {
+              aiNode.innerHTML += `\n\n❗ ${escapeHtml(payload)}`;
+            }
+            if (event === "done") {
+              // Optionally add a small terminator or just stop
+            }
+          }
+        );
+      } catch (err) {
+        aiNode.innerHTML += `\n\n❗ <span class="error">${escapeHtml(String(err))}</span>`;
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    // Submit on Enter (with Shift+Enter for newline)
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        formEl.requestSubmit();
+      }
+    });
+
+    formEl.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const text = inputEl.value.trim();
+      if (!text) return;
+      inputEl.value = "";
+      sendMessage(text);
+    });
+  </script>
+</body>
+</html>
